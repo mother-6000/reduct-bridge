@@ -13,6 +13,10 @@
 // limitations under the License.
 #[cfg(any(feature = "ros1", feature = "ros2", feature = "mqtt"))]
 use crate::message::Attachment;
+#[cfg(any(feature = "ros1", feature = "ros2"))]
+use crate::message::LEGACY_ROS_ATTACHMENT_KEY;
+#[cfg(any(feature = "ros1", feature = "ros2", feature = "mqtt"))]
+use crate::message::SCHEMA_ATTACHMENT_KEY;
 use crate::message::{Message, Record};
 use crate::remote::RemoteInstanceLauncher;
 use crate::runtime::ComponentRuntime;
@@ -196,6 +200,25 @@ impl ReductInstance {
         }
     }
 
+    #[cfg(any(feature = "ros1", feature = "ros2"))]
+    async fn resolve_attachment_key(
+        cfg: &RemoteConfig,
+        bucket: &Bucket,
+        mut attachment: Attachment,
+    ) -> Attachment {
+        if attachment.key == SCHEMA_ATTACHMENT_KEY {
+            if let Some(entry) = Self::normalize_entry_path(&cfg.prefix, &attachment.entry_name) {
+                if matches!(
+                    bucket.read_attachments(&entry).await,
+                    Ok(existing) if existing.contains_key(LEGACY_ROS_ATTACHMENT_KEY)
+                ) {
+                    attachment.key = LEGACY_ROS_ATTACHMENT_KEY.to_string();
+                }
+            }
+        }
+        attachment
+    }
+
     #[cfg(any(feature = "ros1", feature = "ros2", feature = "mqtt"))]
     async fn write_attachment(cfg: &RemoteConfig, bucket: &Bucket, attachment: &Attachment) {
         let Some(entry) = Self::normalize_entry_path(&cfg.prefix, &attachment.entry_name) else {
@@ -337,6 +360,8 @@ impl RemoteInstanceLauncher for ReductInstance {
                             }
                             #[cfg(any(feature = "ros1", feature = "ros2", feature = "mqtt"))]
                             Some(Message::Attachment(attachment)) => {
+                                #[cfg(any(feature = "ros1", feature = "ros2"))]
+                                let attachment = Self::resolve_attachment_key(&cfg, &bucket, attachment).await;
                                 Self::write_attachment(&cfg, &bucket, &attachment).await;
                                 Self::update_attachment_cache(&cfg, &mut attachment_cache, &attachment);
                             }
@@ -595,7 +620,9 @@ mod unit_tests {
 
 #[cfg(all(test, feature = "ci"))]
 mod ci_tests {
-    use super::{CreateBucketConfig, ReductInstance, RemoteConfig};
+    #[cfg(any(feature = "ros1", feature = "ros2"))]
+    use super::LEGACY_ROS_ATTACHMENT_KEY;
+    use super::{CreateBucketConfig, ReductInstance, RemoteConfig, SCHEMA_ATTACHMENT_KEY};
     #[cfg(any(feature = "ros1", feature = "ros2", feature = "mqtt"))]
     use crate::message::Attachment;
     use crate::message::{Message, Record};
@@ -701,7 +728,7 @@ mod ci_tests {
     fn ros_attachment_message() -> Message {
         Message::Attachment(Attachment {
             entry_name: "entry".to_string(),
-            key: "$ros".to_string(),
+            key: SCHEMA_ATTACHMENT_KEY.to_string(),
             payload: json!({
                 "encoding": "ros1",
                 "schema": "float64 x",
@@ -847,10 +874,56 @@ mod ci_tests {
             .read_attachments("it/entry")
             .await
             .expect("read attachments");
-        let payload = attachments.get("$ros").expect("$ros attachment");
+        let payload = attachments
+            .get(SCHEMA_ATTACHMENT_KEY)
+            .expect("$schema attachment");
         assert_eq!(payload["encoding"], "ros1");
         assert_eq!(payload["topic"], "/sensor/pos");
         assert_eq!(payload["schema_name"], "geometry_msgs/Point");
+    }
+
+    #[rstest]
+    #[tokio::test]
+    #[cfg(any(feature = "ros1", feature = "ros2"))]
+    async fn ci_reductstore_keeps_legacy_ros_attachment_key(ros_attachment_message: Message) {
+        let suffix = unique_suffix();
+        let bucket_name = format!("it-{suffix}");
+        let url = reductstore_url();
+        let client = reductstore_client().await;
+
+        let bucket = client
+            .create_bucket(&bucket_name)
+            .exist_ok(true)
+            .send()
+            .await
+            .expect("create bucket");
+
+        bucket
+            .write_attachments(
+                "it/entry",
+                HashMap::from([(
+                    LEGACY_ROS_ATTACHMENT_KEY.to_string(),
+                    json!({"encoding": "ros1"}),
+                )]),
+            )
+            .await
+            .expect("seed legacy attachment");
+
+        let remote = ReductInstance::new(remote_config(url, bucket_name.clone(), None, 300_000));
+        write_data_and_stop(remote, ros_attachment_message).await;
+
+        let attachments = bucket
+            .read_attachments("it/entry")
+            .await
+            .expect("read attachments");
+        let payload = attachments
+            .get(LEGACY_ROS_ATTACHMENT_KEY)
+            .expect("legacy $ros attachment should be updated in place");
+        assert_eq!(payload["topic"], "/sensor/pos");
+        assert!(
+            !attachments.contains_key(SCHEMA_ATTACHMENT_KEY),
+            "should not write a $schema attachment when a legacy $ros key exists"
+        );
     }
 
     #[rstest]
@@ -882,7 +955,7 @@ mod ci_tests {
         let bucket = client.get_bucket(&bucket_name).await.expect("get bucket");
         for _ in 0..10 {
             match bucket.read_attachments("it/entry").await {
-                Ok(attachments) if attachments.contains_key("$ros") => break,
+                Ok(attachments) if attachments.contains_key(SCHEMA_ATTACHMENT_KEY) => break,
                 Ok(_) => {}
                 Err(err) if err.status() == ErrorCode::NotFound => {}
                 Err(err) => panic!("read attachments: {err:?}"),
@@ -894,7 +967,7 @@ mod ci_tests {
         for _ in 0..10 {
             match bucket.remove_attachments("it/entry", None).await {
                 Ok(()) => match bucket.read_attachments("it/entry").await {
-                    Ok(attachments) if !attachments.contains_key("$ros") => {
+                    Ok(attachments) if !attachments.contains_key(SCHEMA_ATTACHMENT_KEY) => {
                         removed = true;
                         break;
                     }
@@ -916,13 +989,13 @@ mod ci_tests {
 
         assert!(
             removed,
-            "expected $ros attachment to be removed before resend"
+            "expected $schema attachment to be removed before resend"
         );
 
         let mut restored = false;
         for _ in 0..30 {
             match bucket.read_attachments("it/entry").await {
-                Ok(attachments) if attachments.contains_key("$ros") => {
+                Ok(attachments) if attachments.contains_key(SCHEMA_ATTACHMENT_KEY) => {
                     restored = true;
                     break;
                 }
@@ -936,7 +1009,7 @@ mod ci_tests {
         runtime.tx.send(Message::Stop).await.expect("send stop");
         runtime.task.await.expect("join remote");
 
-        assert!(restored, "expected $ros attachment to be resent");
+        assert!(restored, "expected $schema attachment to be resent");
     }
 
     #[rstest]
@@ -968,7 +1041,7 @@ mod ci_tests {
         let bucket = client.get_bucket(&bucket_name).await.expect("get bucket");
         for _ in 0..10 {
             match bucket.read_attachments("it/entry").await {
-                Ok(attachments) if attachments.contains_key("$ros") => break,
+                Ok(attachments) if attachments.contains_key(SCHEMA_ATTACHMENT_KEY) => break,
                 Ok(_) => {}
                 Err(err) if err.status() == ErrorCode::NotFound => {}
                 Err(err) => panic!("read attachments: {err:?}"),
@@ -987,7 +1060,7 @@ mod ci_tests {
         runtime.task.await.expect("join remote");
 
         match bucket.read_attachments("it/entry").await {
-            Ok(attachments) => assert!(!attachments.contains_key("$ros")),
+            Ok(attachments) => assert!(!attachments.contains_key(SCHEMA_ATTACHMENT_KEY)),
             Err(err) if err.status() == ErrorCode::NotFound => {}
             Err(err) => panic!("read attachments: {err:?}"),
         }
