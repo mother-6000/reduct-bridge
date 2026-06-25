@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## 0.4.0 - 2026-06-25
+
 ### Changed
 
 - ROS1/ROS2 schema metadata is now stored under the `$schema` attachment key by default, falling back to the legacy `$ros` key for entries that already carry one, [PR-51](https://github.com/reductstore/reduct-bridge/pull/51).
